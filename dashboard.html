@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>中国主要城市房价数据看板</title>
+    <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+    <style>
+      :root {
+        --bg: #e9f0f6;
+        --panel: #f3f8fc;
+        --line: #b8cddd;
+        --text: #24485e;
+      }
+      * { box-sizing: border-box; font-family: "Microsoft YaHei", sans-serif; }
+      body { margin: 0; background: var(--bg); color: var(--text); }
+      .layout { display: grid; grid-template-columns: 320px 1fr; gap: 14px; padding: 14px; }
+      .card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; box-shadow: 0 4px 12px rgba(27,73,95,.06); }
+      .sidebar { padding: 14px; max-height: calc(100vh - 28px); overflow: auto; }
+      .block { margin-bottom: 14px; padding: 12px; border: 1px solid var(--line); border-radius: 10px; background: #edf5fb; }
+      .block h4 { margin: 0 0 8px; font-size: 15px; }
+      label, select, input { font-size: 14px; }
+      select, input[type="month"] { width: 100%; border-radius: 8px; border: 1px solid var(--line); padding: 8px; background: #fff; }
+      .cities { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px 8px; max-height: 240px; overflow: auto; }
+      button { border: none; border-radius: 10px; padding: 10px 12px; background: linear-gradient(180deg,#45a8ff,#2582df); color: white; cursor: pointer; font-weight: 600; }
+      .main { padding: 10px; }
+      .title { text-align: center; font-weight: 700; font-size: 22px; margin: 10px 0 0; }
+      .subtitle { text-align: center; color: #4b7089; margin: 6px 0 10px; }
+      #chart { width: 100%; height: 620px; }
+      table { width: 100%; border-collapse: collapse; font-size: 14px; margin: 8px 0 2px; }
+      th, td { border-top: 1px solid var(--line); padding: 8px; text-align: center; }
+      th { background: #e1edf7; }
+      .footer-note { font-size: 12px; color: #4d708a; padding: 8px; }
+    </style>
+  </head>
+  <body>
+    <div class="layout">
+      <aside class="card sidebar">
+        <h3>设置</h3>
+        <div class="block">
+          <h4>数据源</h4>
+          <select disabled><option>多源自动采集（统计局/自定义JSON/镜像回退）</option></select>
+        </div>
+        <div class="block">
+          <h4>城市（可多选）</h4>
+          <div class="cities" id="cityList"></div>
+        </div>
+        <div class="block">
+          <h4>时间区间</h4>
+          <label>起点</label><input id="startMonth" type="month" />
+          <label style="margin-top:8px;display:block;">终点</label><input id="endMonth" type="month" />
+        </div>
+        <button id="renderBtn">一键生成</button>
+      </aside>
+
+      <main class="card main">
+        <div class="title">热点城市二手房价格趋势图</div>
+        <div class="subtitle" id="meta"></div>
+        <div id="chart"></div>
+        <table>
+          <thead>
+            <tr>
+              <th>城市</th><th>起点指数</th><th>区间峰值</th><th>最新指数</th><th>累计涨跌幅</th><th>跌回时间</th><th>较峰值回撤</th>
+            </tr>
+          </thead>
+          <tbody id="summaryBody"></tbody>
+        </table>
+        <div class="footer-note" id="note"></div>
+      </main>
+    </div>
+
+    <script>
+      const chart = echarts.init(document.getElementById('chart'));
+      let raw = null;
+
+      const toDate = (s) => new Date(`${s}-01T00:00:00`);
+
+      function getSelectedCities() {
+        return [...document.querySelectorAll('input[name="city"]:checked')].map(i => i.value);
+      }
+
+      function inRange(date, start, end) {
+        return (!start || date >= start) && (!end || date <= end);
+      }
+
+      function createCityOptions(cities) {
+        const list = document.getElementById('cityList');
+        const defaults = new Set(['北京', '上海', '广州', '深圳', '杭州', '南京']);
+        list.innerHTML = '';
+        cities.forEach((city, idx) => {
+          const id = `c-${idx}`;
+          const wrap = document.createElement('label');
+          wrap.innerHTML = `<input id="${id}" type="checkbox" name="city" value="${city}" ${defaults.has(city) ? 'checked' : ''}> ${city}`;
+          list.appendChild(wrap);
+        });
+      }
+
+      function getRollbackMonth(points) {
+        if (!points.length) return '-';
+        const latest = points.at(-1).value;
+        const peak = Math.max(...points.map(p => p.value));
+        const peakIndex = points.findIndex(p => p.value === peak);
+        if (peakIndex < 0) return '-';
+        const back = points.slice(0, peakIndex + 1).reverse().find(p => p.value <= latest);
+        return back ? back.date : points[0].date;
+      }
+
+      function setMonthBounds() {
+        const first = Object.values(raw.cities)[0][0].date;
+        const last = Object.values(raw.cities)[0].at(-1).date;
+        document.getElementById('startMonth').value = first;
+        document.getElementById('endMonth').value = last;
+      }
+
+      function render() {
+        const selected = getSelectedCities();
+        const startStr = document.getElementById('startMonth').value;
+        const endStr = document.getElementById('endMonth').value;
+        const start = startStr ? toDate(startStr) : null;
+        const end = endStr ? toDate(endStr) : null;
+
+        const series = [];
+        const summaryRows = [];
+
+        selected.forEach(city => {
+          const filtered = raw.cities[city].filter(p => inRange(toDate(p.date), start, end));
+          if (!filtered.length) return;
+
+          const values = filtered.map(p => p.value);
+          const latest = values.at(-1);
+          const peak = Math.max(...values);
+          const peakPoint = filtered.find(p => p.value === peak);
+          const base = values[0];
+          const total = ((latest / base - 1) * 100).toFixed(1);
+          const drawdown = ((latest / peak - 1) * 100).toFixed(1);
+          const rollback = getRollbackMonth(filtered);
+
+          summaryRows.push({ city, base, peak, latest, total, drawdown, rollback });
+
+          series.push({
+            name: city,
+            type: 'line',
+            smooth: true,
+            showSymbol: false,
+            data: filtered.map(p => [p.date, p.value]),
+            markPoint: {
+              symbol: 'circle',
+              symbolSize: 28,
+              data: [{
+                name: '最高点',
+                coord: [peakPoint.date, peakPoint.value],
+                value: `最高点\n${peakPoint.date}`,
+                label: { fontSize: 10 },
+              }],
+            },
+            markLine: {
+              symbol: ['none', 'arrow'],
+              lineStyle: { type: 'dashed', width: 1.5, opacity: 0.9 },
+              label: { formatter: `跌回 ${rollback}`, fontSize: 11 },
+              data: [{
+                coords: [[rollback, latest], [filtered.at(-1).date, latest]],
+              }],
+            },
+          });
+        });
+
+        chart.setOption({
+          tooltip: { trigger: 'axis' },
+          legend: { bottom: 8 },
+          grid: { left: 50, right: 40, top: 40, bottom: 60 },
+          xAxis: {
+            type: 'time',
+            min: startStr ? `${startStr}-01` : null,
+            max: endStr ? `${endStr}-01` : null,
+          },
+          yAxis: { type: 'value', name: raw.meta.unit },
+          series,
+        });
+
+        const tbody = document.getElementById('summaryBody');
+        tbody.innerHTML = summaryRows.map(r => `<tr>
+          <td>${r.city}</td><td>${r.base.toFixed(1)}</td><td>${r.peak.toFixed(1)}</td><td>${r.latest.toFixed(1)}</td>
+          <td>${r.total}%</td><td>${r.rollback}</td><td>${r.drawdown}%</td>
+        </tr>`).join('');
+
+        document.getElementById('meta').textContent = `${startStr} - ${endStr} ｜ ${raw.meta.source} ｜ ${raw.meta.unit}`;
+      }
+
+      async function init() {
+        const resp = await fetch('./data/house_price_index.json');
+        raw = await resp.json();
+        const cities = Object.keys(raw.cities);
+        createCityOptions(cities);
+        setMonthBounds();
+        document.getElementById('note').textContent = `更新时间：${raw.meta.updated_at}；${raw.meta.note}`;
+        render();
+      }
+
+      document.getElementById('renderBtn').addEventListener('click', render);
+      init();
+      window.addEventListener('resize', () => chart.resize());
+    </script>
+  </body>
+</html>
